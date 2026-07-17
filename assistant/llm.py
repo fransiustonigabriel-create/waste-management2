@@ -1,27 +1,56 @@
 from typing import Final
 
 import streamlit as st
-from google import genai
-from google.genai import types
+from groq import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    Groq,
+    RateLimitError,
+)
 
 
-MODEL_NAME: Final[str] = "gemini-3.5-flash"
+MODEL_NAME: Final[str] = "llama-3.3-70b-versatile"
 
 MAX_PROMPT_LENGTH: Final[int] = 12_000
-REQUEST_TIMEOUT_MS: Final[int] = 60_000
+REQUEST_TIMEOUT_SECONDS: Final[float] = 30.0
+MAX_OUTPUT_TOKENS: Final[int] = 500
+
+
+SYSTEM_INSTRUCTION: Final[str] = """
+Anda adalah EcoRoute AI Assistant, asisten pendukung keputusan
+untuk pengelolaan sampah perkotaan.
+
+Gunakan hanya informasi yang tersedia di dalam:
+- Knowledge Base
+- jawaban lokal sementara
+- kondisi yang terdeteksi
+- rekomendasi operasional
+
+Aturan:
+1. Jangan mengarang angka, lokasi, hasil model, metrik, atau fakta.
+2. Jangan menambahkan rekomendasi yang tidak didukung context.
+3. Jika informasi tidak cukup, katakan dengan jelas bahwa
+   informasi belum tersedia.
+4. Jawab dalam Bahasa Indonesia yang jelas, profesional,
+   ringkas, dan mudah dipahami.
+5. Utamakan maksimal tiga paragraf atau beberapa bullet singkat.
+6. Untuk pertanyaan perbandingan, jelaskan hanya berdasarkan
+   informasi model yang benar-benar tersedia di context.
+""".strip()
 
 
 def get_api_key() -> str:
     """
-    Mengambil Gemini API key dari Streamlit secrets.
+    Mengambil Groq API key dari Streamlit secrets.
     """
 
     try:
-        api_key = st.secrets["GEMINI_API_KEY"]
+        api_key = st.secrets["GROQ_API_KEY"]
 
     except KeyError as error:
         raise RuntimeError(
-            "GEMINI_API_KEY belum ditemukan di "
+            "GROQ_API_KEY belum ditemukan di "
             ".streamlit/secrets.toml."
         ) from error
 
@@ -34,7 +63,7 @@ def get_api_key() -> str:
 
     if not api_key:
         raise RuntimeError(
-            "GEMINI_API_KEY tersedia, tetapi nilainya kosong."
+            "GROQ_API_KEY tersedia, tetapi nilainya kosong."
         )
 
     return api_key
@@ -42,11 +71,10 @@ def get_api_key() -> str:
 
 def shorten_prompt(prompt: str) -> str:
     """
-    Membatasi panjang prompt agar request lebih cepat
-    dan tidak membawa context berlebihan.
+    Membatasi panjang prompt agar context tidak berlebihan.
     """
 
-    clean_prompt = prompt.strip()
+    clean_prompt = str(prompt).strip()
 
     if len(clean_prompt) <= MAX_PROMPT_LENGTH:
         return clean_prompt
@@ -59,80 +87,111 @@ def shorten_prompt(prompt: str) -> str:
 
 def generate_response(prompt: str) -> str:
     """
-    Mengirim prompt EcoRoute AI ke Gemini.
+    Mengirim prompt EcoRoute AI ke Groq.
+
+    Fungsi ini mempertahankan interface lama agar assistant.py
+    dan modul lainnya tidak perlu diubah.
     """
 
     clean_prompt = shorten_prompt(prompt)
 
     if not clean_prompt:
         return (
-            "Maaf, prompt untuk Gemini kosong sehingga "
+            "Maaf, prompt untuk Groq kosong sehingga "
             "jawaban belum dapat dibuat."
         )
 
     try:
-        api_key = get_api_key()
+        client = Groq(
+            api_key=get_api_key(),
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            max_retries=1,
+        )
 
-        with genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(
-                timeout=REQUEST_TIMEOUT_MS
-            ),
-        ) as client:
-
-            interaction = client.interactions.create(
-                model=MODEL_NAME,
-
-                system_instruction=(
-                    "Anda adalah EcoRoute AI Assistant, "
-                    "asisten keputusan operasional untuk "
-                    "pengelolaan sampah perkotaan. "
-                    "Gunakan hanya informasi dari Knowledge "
-                    "Context dan Operational Recommendation "
-                    "yang terdapat di dalam input. "
-                    "Jangan mengarang angka, lokasi, hasil model, "
-                    "atau rekomendasi yang tidak tersedia. "
-                    "Jawab dalam Bahasa Indonesia yang jelas, "
-                    "ringkas, profesional, dan mudah dipahami. "
-                    "Utamakan jawaban maksimal 3 paragraf atau "
-                    "beberapa bullet singkat. "
-                    "Jika informasi tidak tersedia, katakan "
-                    "bahwa informasi tersebut belum tersedia."
-                ),
-
-                input=clean_prompt,
-
-                generation_config={
-                    "thinking_level": "low",
-                    "temperature": 0.2,
-                    "max_output_tokens": 500,
+        completion = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": SYSTEM_INSTRUCTION,
                 },
+                {
+                    "role": "user",
+                    "content": clean_prompt,
+                },
+            ],
+            temperature=0.2,
+            max_completion_tokens=MAX_OUTPUT_TOKENS,
+            top_p=1,
+            stream=False,
+        )
+
+        if not completion.choices:
+            return (
+                "Groq berhasil dihubungi, tetapi tidak "
+                "menghasilkan pilihan jawaban."
             )
 
-        answer = interaction.output_text
+        answer = completion.choices[0].message.content
 
         if not answer or not answer.strip():
             return (
-                "Gemini berhasil dihubungi, tetapi tidak "
+                "Groq berhasil dihubungi, tetapi tidak "
                 "menghasilkan jawaban teks."
             )
 
         return answer.strip()
 
-    except Exception as error:
-        error_text = str(error)
+    except APITimeoutError:
+        return (
+            "Maaf, Groq membutuhkan waktu terlalu lama "
+            "untuk menjawab. Silakan coba kembali."
+        )
 
-        if (
-            "timeout" in error_text.lower()
-            or "timed out" in error_text.lower()
-        ):
+    except RateLimitError:
+        return (
+            "Maaf, batas penggunaan Groq sedang tercapai. "
+            "Silakan tunggu sebentar lalu coba kembali."
+        )
+
+    except APIConnectionError:
+        return (
+            "Maaf, EcoRoute AI tidak dapat terhubung ke Groq. "
+            "Periksa koneksi internet lalu coba kembali."
+        )
+
+    except APIStatusError as error:
+        status_code = getattr(
+            error,
+            "status_code",
+            "unknown",
+        )
+
+        if status_code == 401:
             return (
-                "Maaf, Gemini membutuhkan waktu terlalu lama "
-                "untuk menjawab. Silakan coba kembali dengan "
-                "pertanyaan yang lebih singkat."
+                "Maaf, Groq API key tidak valid atau tidak "
+                "memiliki izin akses."
+            )
+
+        if status_code == 403:
+            return (
+                "Maaf, akun atau project Groq tidak memiliki "
+                "izin menggunakan model yang dipilih."
+            )
+
+        if status_code == 429:
+            return (
+                "Maaf, batas penggunaan Groq sedang tercapai. "
+                "Silakan tunggu sebentar lalu coba kembali."
             )
 
         return (
-            "Maaf, EcoRoute AI belum dapat menghubungi Gemini.\n\n"
-            f"**Detail:** `{error_text}`"
+            "Maaf, Groq mengembalikan kesalahan layanan.\n\n"
+            f"**Status:** `{status_code}`"
+        )
+
+    except Exception as error:
+        return (
+            "Maaf, EcoRoute AI belum dapat menghubungi Groq.\n\n"
+            f"**Detail:** `{error}`"
         )
